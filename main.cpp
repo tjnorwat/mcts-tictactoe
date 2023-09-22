@@ -9,7 +9,7 @@
 #include <cmath>
 #include <algorithm>
 #include <array>
-
+#include <x86intrin.h>
 
 #include "XoshiroCpp.hpp"
 
@@ -101,7 +101,7 @@ struct GameState {
     // uint16_t lsb = _blsi_u32(board);
     // uint16_t lsb = (board & -board);
     // board ^= lsb;
-
+    // blsi might be faster
     array<GameState, 9> generateValidMoveStates() const {
         uint16_t board = (~(this->agent | this->opponent)) ^ OUT_OF_BOUNDS;
         array<GameState, 9> next_states;
@@ -168,7 +168,7 @@ struct Node {
 
     Node* select() {
         std::unique_ptr<Node>* best_child = nullptr;  // Pointer to unique_ptr
-        double best_value = -INFINITY;  // Initialize to a very small value
+        double best_value = INT32_MIN;  // Initialize to a very small value
 
         // go through all the children and find the one with the highest UCB1 value
         for (int i = 0; i < this->state.possible_moves; i++) {  // Notice the auto& to get a reference to the unique_ptr
