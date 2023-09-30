@@ -5,13 +5,9 @@
 #include <vector>
 
 #include <cstdlib>
-#include <memory>
+
 #include <cmath>
 #include <algorithm>
-#include <array>
-#include <x86intrin.h>
-
-#include "XoshiroCpp.hpp"
 
 using namespace std;
 
@@ -45,25 +41,18 @@ struct GameState {
     uint16_t move_idx = -1;
     bool agent_turn = true;
 
-    uint16_t possible_moves = 9;
-    bool is_terminal = false;
-    int score = 0;
-
     GameState() {}
 
 
     void playMove(const uint16_t& move_idx) {
         this->move_idx = move_idx;
-        this->possible_moves--;
         if (this->agent_turn) {
             this->agent |= 0b1 << move_idx;
             this->agent_turn = false;
-            this->is_terminal = this->isDraw() || this->evaluateAgent();
         }
         else {
             this->opponent |= 0b1 << move_idx;
             this->agent_turn = true;
-            this->is_terminal = this->isDraw() || this->evaluateOpponent();
         }
     }
 
@@ -71,26 +60,40 @@ struct GameState {
         return (this->agent | this->opponent) == FULL_BOARD;
     }
 
-    // break into two functions 
-    // might be useful later ? 
-    constexpr int evaluateAgent() {
-        for (const uint16_t pattern : WINNING_PATTERNS) {
-            if ((this->agent & pattern) == pattern) {
-                this->score = 1;
+    // can evaluate just the player that made turn instead of both ?
+    // have to evaluate both for snake
+    constexpr int evaluateTerminalState() const {
+        for (uint16_t pattern : WINNING_PATTERNS) {
+            if ((this->agent & pattern) == pattern) 
                 return 1;
-            }
+            else if ((this->opponent & pattern) == pattern) 
+                return -1;
         }
         return 0;
     }
 
-    constexpr int evaluateOpponent() {
-        for (const uint16_t pattern : WINNING_PATTERNS) {
-            if ((this->opponent & pattern) == pattern){
-                this->score = -1;
-                return -1;
-            }
+    // break into two functions 
+    // might be useful later ? 
+    constexpr int evaluateAgent() const {
+        for (uint16_t pattern : WINNING_PATTERNS) {
+            if ((this->agent & pattern) == pattern) 
+                return 1;
         }
         return 0;
+    }
+
+    constexpr int evaluateOpponent() const {
+        for (uint16_t pattern : WINNING_PATTERNS) {
+            if ((this->opponent & pattern) == pattern) 
+                return -1;
+        }
+        return 0;
+    }
+
+    constexpr bool isTerminal() const {
+        if (this->isDraw() || this->evaluateTerminalState())
+            return true;
+        return false;
     }
 
     // gets all possible moves a player can put a marker 
@@ -101,19 +104,18 @@ struct GameState {
     // uint16_t lsb = _blsi_u32(board);
     // uint16_t lsb = (board & -board);
     // board ^= lsb;
-    // blsi might be faster
-    array<GameState, 9> generateValidMoveStates() const {
+
+    vector<GameState> generateValidMoveStates() const {
         uint16_t board = (~(this->agent | this->opponent)) ^ OUT_OF_BOUNDS;
-        array<GameState, 9> next_states;
-        int i = 0;
+        vector<GameState> next_states;
+
         while (board) {
             uint16_t idx = __builtin_ctz(board);
             GameState next_state = *this;
 
             next_state.playMove(idx);
 
-            next_states[i] = (next_state);
-            i++;
+            next_states.push_back(next_state);
             board ^= 0b1 << idx;
         }
         return next_states;
@@ -137,128 +139,106 @@ struct GameState {
 };
 
 
-// random_device r;
-// default_random_engine generator{r()};
-XoshiroCpp::Xoshiro256Plus rng(111);
 
-// changing vectors to arrays 
+random_device r;
+default_random_engine generator{r()};
 
 struct Node {
     Node* parent;
-    GameState state;
-    array<unique_ptr<Node>, 9> children;
-    array<GameState, 9> unexpanded_states;
+    GameState state;  
+    vector<Node*> children;
+    vector<GameState> unexpanded_states;
     uint32_t states_left;
-
-    int unexpanded_states_idx = 0;
-    int children_idx = 0;
 
     int score = 0;  
     uint32_t visits = 0;
 
     Node() {}
 
-    Node(Node* parent, const GameState &state) {
+    Node(Node *parent, const GameState &state) {
         this->parent = parent;
         this->state = state;
 
         this->unexpanded_states = state.generateValidMoveStates();
-        this->states_left = state.possible_moves;
+        this->states_left = unexpanded_states.size();
+        std::shuffle(this->unexpanded_states.begin(), this->unexpanded_states.end(), generator);
+    }
+
+    ~Node() {
+        for (Node* child : children) {
+            delete child;
+        }
     }
 
     Node* select() {
-        std::unique_ptr<Node>* best_child = nullptr;  // Pointer to unique_ptr
-        double best_value = INT32_MIN;  // Initialize to a very small value
+        Node* best_child = nullptr;
+        double best_value = -INFINITY;  
 
-        // go through all the children and find the one with the highest UCB1 value
-        for (int i = 0; i < this->state.possible_moves; i++) {  // Notice the auto& to get a reference to the unique_ptr
-            auto& child = this->children[i];
+        for (Node* child : this->children) {
             // UCB1 formula
-            // double q_value = 1 - ((child->score / (double)child->visits) + 1) / 2;
-            double ucb = (child->score / (double)child->visits) + 2 * sqrt(log(this->visits) / (double)child->visits);
+            double ucb = (child->score / (double)child->visits) + 1.4 * sqrt(log(this->visits) / (double)child->visits);
             
             if (ucb > best_value) {
                 best_value = ucb;
-                best_child = &child;  // Notice that we're storing a pointer to the unique_ptr
+                best_child = child;
             }
         }
-        return best_child->get();  // De-referencing to return the actual unique_ptr
+        return best_child;
     }
 
-
-    // goal is to get a new state from list of unexpanded states
-    // returning new node with that state 
-
-    // is better way just create all child nodes and then check to see if it has been visited ? 
-    // runs into the issue of randomly picking a child node that has already been visited
-    // unless going through sequentially (shuffle? )
-
-
-    // if we need 2 vectors, could store list of indexes and then compute state? 
-    // need to still pop and push 
-    // save memory 
-
-    // expand should be random ? 
     Node* expand() {
-        GameState nextState = this->unexpanded_states[this->unexpanded_states_idx];
-        this->unexpanded_states_idx++;
 
-        this->states_left--;
-        
-        auto child = std::make_unique<Node>(this, nextState);
-        Node* raw_child_ptr = child.get(); // Store the raw pointer before moving ownership to the vector
-        this->children[this->children_idx] = (std::move(child)); // std::move transfers ownership
-        this->children_idx++;
-
-        return raw_child_ptr;
+        GameState next_state = this->unexpanded_states.back();
+        this->unexpanded_states.pop_back();
+        Node* child = new Node(this, next_state);
+        this->children.push_back(child);
+        return child;
     }
 
     int simulate() {
         GameState current_state = this->state;
-        while (!current_state.is_terminal) {
-            // Generate valid moves for the current state
-            array<GameState, 9> next_states = current_state.generateValidMoveStates();
+        while (!current_state.isTerminal()) {
+            vector<GameState> next_states = current_state.generateValidMoveStates();
 
             // Pick a random move
-            uniform_int_distribution<int> dist(0, current_state.possible_moves - 1);
-            current_state = next_states[dist(rng)];
+            uniform_int_distribution<int> distribution(0, next_states.size() - 1);
+            current_state = next_states[distribution(generator)];
         }
 
         // Evaluate the terminal state to find out who won
         // Return 1 if win, 0 if draw, -1 if lose
-        return current_state.score;
+        return current_state.evaluateTerminalState();
     }
 
     void backpropagate(int result) {
-        Node* current = this; // 'this' is already a raw pointer
+        Node* current = this;
         while (current != nullptr) {
             current->visits++;
-            current->score += result;
-            current = current->parent; // Get the raw pointer from unique_ptr
+            current->score += result; 
+            current = current->parent;
         }
     }
 
-    // did we go through all of the possible moves? 
     bool fullyExpanded() const {
-        return this->unexpanded_states_idx == this->state.possible_moves;
-        // return this->unexpanded_states.empty();
-        // return this->children.size() == this->states_left;
+        return this->unexpanded_states.empty();
     }
 
-    // is this node a terminal state? 
     bool isLeaf() const {
-        return this->state.is_terminal;
-        // return this->state.isTerminal();
+        return this->state.isTerminal();
     }
 };
 
 
 struct MCTS {
 
-    std::unique_ptr<Node> root;
+    Node* root;
 
-    MCTS(const GameState& state) {
-        this->root = std::make_unique<Node>(nullptr, state);
+    MCTS(GameState state) {
+        this->root = new Node(nullptr, state);
+    }
+
+    ~MCTS() {
+        delete this->root;
     }
 
     uint16_t search() {
@@ -266,18 +246,18 @@ struct MCTS {
         int iterations = 0;
         while (true) {
             auto time_now = chrono::steady_clock::now();
-            if (chrono::duration<double, milli>(time_now - time_start).count() > 500)
+            if (chrono::duration<double, milli>(time_now - time_start).count() > 100)
                 break;
 
-            Node* node = this->root.get();  // get the raw pointer from the unique_ptr
-
+            Node *node = this->root;
+            
             while (node->fullyExpanded()) {
-                node = node->select();  // select() returns a Node*
+                node = node->select();
             }
 
             // if the node is not a terminal state, expand and simulate
             if (!node->isLeaf()) {
-                node = node->expand();  // expand() returns a Node*
+                node = node->expand();
                 int value = node->simulate();
                 node->backpropagate(value);
             }
@@ -287,8 +267,7 @@ struct MCTS {
 
         double best_ratio = -INFINITY;
         uint16_t best_play;
-        for (int i = 0; i < this->root->state.possible_moves; i++) {
-            auto& child = this->root->children[i];
+        for (Node* child : this->root->children) {
             double win_ratio = child->score / (double)child->visits;
 
             if (win_ratio > best_ratio) {
@@ -299,6 +278,12 @@ struct MCTS {
         return best_play;
     }
 };
+
+
+void PlayGame() {
+
+}
+
 
 int main() {
 
@@ -313,8 +298,7 @@ int main() {
 
     // cout << "Parent visits " << mcts.root->visits << endl;
 
-    for (int i = 0; i < mcts.root->state.possible_moves; i++) {
-        auto& child = mcts.root->children[i];
+    for (const Node* child : mcts.root->children) {
         cout << "Score " << child->score << " " << "Visits " << child->visits << endl;
         cout << "Win ratio " << child->score / (double)child->visits << endl;
         child->state.print_board();

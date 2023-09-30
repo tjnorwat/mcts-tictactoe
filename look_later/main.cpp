@@ -8,6 +8,8 @@
 #include <memory>
 #include <cmath>
 #include <algorithm>
+#include <array>
+#include <x86intrin.h>
 
 #include "XoshiroCpp.hpp"
 
@@ -69,8 +71,6 @@ struct GameState {
         return (this->agent | this->opponent) == FULL_BOARD;
     }
 
-    // break into two functions 
-    // might be useful later ? 
     constexpr int evaluateAgent() {
         for (const uint16_t pattern : WINNING_PATTERNS) {
             if ((this->agent & pattern) == pattern) {
@@ -99,21 +99,21 @@ struct GameState {
     // uint16_t lsb = _blsi_u32(board);
     // uint16_t lsb = (board & -board);
     // board ^= lsb;
-
-    vector<GameState> generateValidMoveStates() const {
+    // blsi might be faster
+    array<GameState, 9> generateValidMoveStates() const {
         uint16_t board = (~(this->agent | this->opponent)) ^ OUT_OF_BOUNDS;
-        vector<GameState> next_states;
-        next_states.reserve(this->possible_moves);
+        array<GameState, 9> next_states;
+        int i = 0;
         while (board) {
             uint16_t idx = __builtin_ctz(board);
             GameState next_state = *this;
 
             next_state.playMove(idx);
 
-            next_states.push_back(next_state);
+            next_states[i] = (next_state);
+            i++;
             board ^= 0b1 << idx;
         }
-
         return next_states;
     }
 
@@ -137,18 +137,20 @@ struct GameState {
 
 // random_device r;
 // default_random_engine generator{r()};
-XoshiroCpp::Xoshiro256Plus rng(111);
+XoshiroCpp::Xoshiro256Plus rng;
 
 // changing vectors to arrays 
 
 struct Node {
     Node* parent;
     GameState state;
-    vector<unique_ptr<Node>> children;
-    vector<GameState> unexpanded_states;
-    uint32_t states_left;
+    array<unique_ptr<Node>, 9> children;
+    array<GameState, 9> unexpanded_states;
 
-    int score = 0;  
+    int unexpanded_states_idx = 0;
+    int children_idx = 0;
+
+    int score = 0;
     uint32_t visits = 0;
 
     Node() {}
@@ -158,15 +160,15 @@ struct Node {
         this->state = state;
 
         this->unexpanded_states = state.generateValidMoveStates();
-        this->states_left = unexpanded_states.size();
     }
 
     Node* select() {
         std::unique_ptr<Node>* best_child = nullptr;  // Pointer to unique_ptr
-        double best_value = -INFINITY;  // Initialize to a very small value
+        double best_value = INT32_MIN;  // Initialize to a very small value
 
         // go through all the children and find the one with the highest UCB1 value
-        for (auto& child : this->children) {  // Notice the auto& to get a reference to the unique_ptr
+        for (int i = 0; i < this->state.possible_moves; i++) {  // Notice the auto& to get a reference to the unique_ptr
+            auto& child = this->children[i];
             // UCB1 formula
             // double q_value = 1 - ((child->score / (double)child->visits) + 1) / 2;
             double ucb = (child->score / (double)child->visits) + 2 * sqrt(log(this->visits) / (double)child->visits);
@@ -182,25 +184,14 @@ struct Node {
 
     // goal is to get a new state from list of unexpanded states
     // returning new node with that state 
-
-    // is better way just create all child nodes and then check to see if it has been visited ? 
-    // runs into the issue of randomly picking a child node that has already been visited
-    // unless going through sequentially (shuffle? )
-
-
-    // if we need 2 vectors, could store list of indexes and then compute state? 
-    // need to still pop and push 
-    // save memory 
-
-    // expand should be random ? 
     Node* expand() {
-        GameState nextState = this->unexpanded_states.back();
-        this->unexpanded_states.pop_back();
-        this->states_left--;
+        GameState next_state = this->unexpanded_states[this->unexpanded_states_idx];
+        this->unexpanded_states_idx++;
         
-        auto child = std::make_unique<Node>(this, nextState);
+        auto child = std::make_unique<Node>(this, next_state);
         Node* raw_child_ptr = child.get(); // Store the raw pointer before moving ownership to the vector
-        this->children.push_back(std::move(child)); // std::move transfers ownership
+        this->children[this->children_idx] = (std::move(child)); // std::move transfers ownership
+        this->children_idx++;
 
         return raw_child_ptr;
     }
@@ -209,7 +200,7 @@ struct Node {
         GameState current_state = this->state;
         while (!current_state.is_terminal) {
             // Generate valid moves for the current state
-            vector<GameState> next_states = current_state.generateValidMoveStates();
+            array<GameState, 9> next_states = current_state.generateValidMoveStates();
 
             // Pick a random move
             uniform_int_distribution<int> dist(0, current_state.possible_moves - 1);
@@ -232,16 +223,30 @@ struct Node {
 
     // did we go through all of the possible moves? 
     bool fullyExpanded() const {
-        return this->states_left == 0;
-        // return this->unexpanded_states.empty();
-        // return this->children.size() == this->states_left;
+        return this->unexpanded_states_idx == this->state.possible_moves;
     }
 
     // is this node a terminal state? 
     bool isLeaf() const {
         return this->state.is_terminal;
-        // return this->state.isTerminal();
     }
+
+
+    void to_string() const {
+
+        cout << "PARENT" << endl;
+        this->state.print_board();
+        cout << endl;
+
+
+        for (int i = 0; i < this->state.possible_moves; i++) {
+            auto& child = this->children[i];
+            child->state.print_board();
+            cout << endl;
+        }
+
+    }
+
 };
 
 
@@ -258,7 +263,7 @@ struct MCTS {
         int iterations = 0;
         while (true) {
             auto time_now = chrono::steady_clock::now();
-            if (chrono::duration<double, milli>(time_now - time_start).count() > 500)
+            if (chrono::duration<double, milli>(time_now - time_start).count() > 1000)
                 break;
 
             Node* node = this->root.get();  // get the raw pointer from the unique_ptr
@@ -279,7 +284,8 @@ struct MCTS {
 
         double best_ratio = -INFINITY;
         uint16_t best_play;
-        for (const auto& child : this->root->children) {
+        for (int i = 0; i < this->root->state.possible_moves; i++) {
+            auto& child = this->root->children[i];
             double win_ratio = child->score / (double)child->visits;
 
             if (win_ratio > best_ratio) {
@@ -302,9 +308,10 @@ int main() {
     uint16_t move = mcts.search();
     cout << "MOVE: " <<  move << endl;
 
-    cout << "Parent visits " << mcts.root->visits << endl;
+    // cout << "Parent visits " << mcts.root->visits << endl;
 
-    for (const auto& child : mcts.root->children) {
+    for (int i = 0; i < mcts.root->state.possible_moves; i++) {
+        auto& child = mcts.root->children[i];
         cout << "Score " << child->score << " " << "Visits " << child->visits << endl;
         cout << "Win ratio " << child->score / (double)child->visits << endl;
         child->state.print_board();

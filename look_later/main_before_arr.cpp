@@ -5,9 +5,13 @@
 #include <vector>
 
 #include <cstdlib>
-
+#include <memory>
 #include <cmath>
 #include <algorithm>
+#include <array>
+#include <x86intrin.h>
+
+#include "XoshiroCpp.hpp"
 
 using namespace std;
 
@@ -41,18 +45,25 @@ struct GameState {
     uint16_t move_idx = -1;
     bool agent_turn = true;
 
+    uint16_t possible_moves = 9;
+    bool is_terminal = false;
+    int score = 0;
+
     GameState() {}
 
 
     void playMove(const uint16_t& move_idx) {
         this->move_idx = move_idx;
+        this->possible_moves--;
         if (this->agent_turn) {
             this->agent |= 0b1 << move_idx;
             this->agent_turn = false;
+            this->is_terminal = this->isDraw() || this->evaluateAgent();
         }
         else {
             this->opponent |= 0b1 << move_idx;
             this->agent_turn = true;
+            this->is_terminal = this->isDraw() || this->evaluateOpponent();
         }
     }
 
@@ -60,40 +71,26 @@ struct GameState {
         return (this->agent | this->opponent) == FULL_BOARD;
     }
 
-    // can evaluate just the player that made turn instead of both ?
-    // have to evaluate both for snake
-    constexpr int evaluateTerminalState() const {
-        for (uint16_t pattern : WINNING_PATTERNS) {
-            if ((this->agent & pattern) == pattern) 
-                return 1;
-            else if ((this->opponent & pattern) == pattern) 
-                return -1;
-        }
-        return 0;
-    }
-
     // break into two functions 
     // might be useful later ? 
-    constexpr int evaluateAgent() const {
-        for (uint16_t pattern : WINNING_PATTERNS) {
-            if ((this->agent & pattern) == pattern) 
+    constexpr int evaluateAgent() {
+        for (const uint16_t pattern : WINNING_PATTERNS) {
+            if ((this->agent & pattern) == pattern) {
+                this->score = 1;
                 return 1;
+            }
         }
         return 0;
     }
 
-    constexpr int evaluateOpponent() const {
-        for (uint16_t pattern : WINNING_PATTERNS) {
-            if ((this->opponent & pattern) == pattern) 
+    constexpr int evaluateOpponent() {
+        for (const uint16_t pattern : WINNING_PATTERNS) {
+            if ((this->opponent & pattern) == pattern){
+                this->score = -1;
                 return -1;
+            }
         }
         return 0;
-    }
-
-    constexpr bool isTerminal() const {
-        if (this->isDraw() || this->evaluateTerminalState())
-            return true;
-        return false;
     }
 
     // gets all possible moves a player can put a marker 
@@ -108,7 +105,7 @@ struct GameState {
     vector<GameState> generateValidMoveStates() const {
         uint16_t board = (~(this->agent | this->opponent)) ^ OUT_OF_BOUNDS;
         vector<GameState> next_states;
-
+        next_states.reserve(this->possible_moves);
         while (board) {
             uint16_t idx = __builtin_ctz(board);
             GameState next_state = *this;
@@ -118,6 +115,7 @@ struct GameState {
             next_states.push_back(next_state);
             board ^= 0b1 << idx;
         }
+
         return next_states;
     }
 
@@ -139,14 +137,16 @@ struct GameState {
 };
 
 
+// random_device r;
+// default_random_engine generator{r()};
+XoshiroCpp::Xoshiro256Plus rng;
 
-random_device r;
-default_random_engine generator{r()};
+// changing vectors to arrays 
 
 struct Node {
     Node* parent;
-    GameState state;  
-    vector<Node*> children;
+    GameState state;
+    vector<unique_ptr<Node>> children;
     vector<GameState> unexpanded_states;
     uint32_t states_left;
 
@@ -155,37 +155,33 @@ struct Node {
 
     Node() {}
 
-    Node(Node *parent, const GameState &state) {
+    Node(Node* parent, const GameState &state) {
         this->parent = parent;
         this->state = state;
 
         this->unexpanded_states = state.generateValidMoveStates();
+        std::shuffle(this->unexpanded_states.begin(), this->unexpanded_states.end(), rng);
         this->states_left = unexpanded_states.size();
     }
 
-    ~Node() {
-        for (Node* child : children) {
-            delete child;
-        }
-    }
-
     Node* select() {
-        Node* best_child = nullptr;
-        double best_value = -INFINITY;  // Initialize to a very small value
+        std::unique_ptr<Node>* best_child = nullptr;  // Pointer to unique_ptr
+        double best_value = INT32_MIN;  // Initialize to a very small value
 
         // go through all the children and find the one with the highest UCB1 value
-        for (Node* child : this->children) {
+        for (auto& child : this->children) {  // Notice the auto& to get a reference to the unique_ptr
             // UCB1 formula
             // double q_value = 1 - ((child->score / (double)child->visits) + 1) / 2;
-            double ucb = (child->score / (double)child->visits) + 2 * sqrt(log(this->visits) / (double)child->visits);
+            double ucb = (child->score / (double)child->visits) + 1.4 * sqrt(log(this->visits) / (double)child->visits);
             
             if (ucb > best_value) {
                 best_value = ucb;
-                best_child = child;
+                best_child = &child;  // Notice that we're storing a pointer to the unique_ptr
             }
         }
-        return best_child;
+        return best_child->get();  // De-referencing to return the actual unique_ptr
     }
+
 
     // goal is to get a new state from list of unexpanded states
     // returning new node with that state 
@@ -201,62 +197,62 @@ struct Node {
 
     // expand should be random ? 
     Node* expand() {
-
         GameState nextState = this->unexpanded_states.back();
         this->unexpanded_states.pop_back();
-        Node* child = new Node(this, nextState);
-        this->children.push_back(child);
-        return child;
+        this->states_left--;
+        
+        auto child = std::make_unique<Node>(this, nextState);
+        Node* raw_child_ptr = child.get(); // Store the raw pointer before moving ownership to the vector
+        this->children.push_back(std::move(child)); // std::move transfers ownership
+
+        return raw_child_ptr;
     }
 
     int simulate() {
         GameState current_state = this->state;
-        while (!current_state.isTerminal()) {
+        while (!current_state.is_terminal) {
             // Generate valid moves for the current state
             vector<GameState> next_states = current_state.generateValidMoveStates();
 
             // Pick a random move
-            uniform_int_distribution<int> distribution(0, next_states.size() - 1);
-            current_state = next_states[distribution(generator)];
+            // uniform_int_distribution<int> dist(0, current_state.possible_moves - 1);
+            uniform_int_distribution<int> dist(0, next_states.size() - 1);
+
+            current_state = next_states[dist(rng)];
         }
 
         // Evaluate the terminal state to find out who won
         // Return 1 if win, 0 if draw, -1 if lose
-        return current_state.evaluateTerminalState();
+        return current_state.score;
     }
 
     void backpropagate(int result) {
-        Node* current = this;
+        Node* current = this; // 'this' is already a raw pointer
         while (current != nullptr) {
             current->visits++;
-            current->score += result; 
-            current = current->parent;
+            current->score += result;
+            current = current->parent; // Get the raw pointer from unique_ptr
         }
     }
 
     // did we go through all of the possible moves? 
     bool fullyExpanded() const {
-        return this->unexpanded_states.empty();
-        // return this->children.size() == this->states_left;
+        return this->states_left == 0;
     }
 
     // is this node a terminal state? 
     bool isLeaf() const {
-        return this->state.isTerminal();
+        return this->state.is_terminal;
     }
 };
 
 
 struct MCTS {
 
-    Node* root;
+    std::unique_ptr<Node> root;
 
-    MCTS(GameState state) {
-        this->root = new Node(nullptr, state);
-    }
-
-    ~MCTS() {
-        delete this->root;
+    MCTS(const GameState& state) {
+        this->root = std::make_unique<Node>(nullptr, state);
     }
 
     uint16_t search() {
@@ -267,15 +263,15 @@ struct MCTS {
             if (chrono::duration<double, milli>(time_now - time_start).count() > 500)
                 break;
 
-            Node *node = this->root;
-            
+            Node* node = this->root.get();  // get the raw pointer from the unique_ptr
+
             while (node->fullyExpanded()) {
-                node = node->select();
+                node = node->select();  // select() returns a Node*
             }
 
             // if the node is not a terminal state, expand and simulate
             if (!node->isLeaf()) {
-                node = node->expand();
+                node = node->expand();  // expand() returns a Node*
                 int value = node->simulate();
                 node->backpropagate(value);
             }
@@ -285,7 +281,7 @@ struct MCTS {
 
         double best_ratio = -INFINITY;
         uint16_t best_play;
-        for (Node* child : this->root->children) {
+        for (const auto& child : this->root->children) {
             double win_ratio = child->score / (double)child->visits;
 
             if (win_ratio > best_ratio) {
@@ -308,14 +304,14 @@ int main() {
     uint16_t move = mcts.search();
     cout << "MOVE: " <<  move << endl;
 
-    // cout << "Parent visits " << mcts.root->visits << endl;
+    cout << "Parent visits " << mcts.root->visits << endl;
 
-    // for (const Node* child : mcts.root->children) {
-    //     cout << "Score " << child->score << " " << "Visits " << child->visits << endl;
-    //     cout << "Win ratio " << child->score / (double)child->visits << endl;
-    //     child->state.print_board();
-    //     cout << endl;
-    // }
+    for (const auto& child : mcts.root->children) {
+        cout << "Score " << child->score << " " << "Visits " << child->visits << endl;
+        cout << "Win ratio " << child->score / (double)child->visits << endl;
+        child->state.print_board();
+        cout << endl;
+    }
 
     return 0;
 }
